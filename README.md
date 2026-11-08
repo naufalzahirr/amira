@@ -25,6 +25,10 @@ Supaya mentor bisa menjawab, masuk sebagai guru, buka **Pengaturan AI**, lalu te
 
 Tes: `php artisan test`
 
+## Pemasangan di hosting
+
+Setiap push ke `main` menjalankan tes lewat GitHub Actions, lalu menyusun paket siap pasang di branch `hosting`, lengkap dengan `vendor/` tanpa paket dev. Server cPanel cukup `git pull`. Langkah pasang dan pembaruan untuk `app.amiraedu.com` ada di [docs/HOSTING.md](docs/HOSTING.md). Template `.env` untuk server ada di `.env.production.example`.
+
 ## Cara kerja
 
 **Guru**

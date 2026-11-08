@@ -1,0 +1,43 @@
+name: Build hosting branch
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: amira-app-hosting
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo_sqlite, sqlite3, gd, mbstring, fileinfo, curl, zip
+          coverage: none
+          tools: composer:v2
+      - name: Install dependencies for tests
+        run: composer install --no-interaction --no-progress --prefer-dist
+      - name: Run tests
+        run: |
+          cp .env.example .env
+          php artisan key:generate --no-interaction
+          php artisan test
+          rm .env
+      - name: Install production dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction --no-progress --prefer-dist
+      - name: Publish prebuilt hosting branch
+        run: bash scripts/publish-hosting.sh --push

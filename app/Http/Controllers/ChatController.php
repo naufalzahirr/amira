@@ -87,6 +87,7 @@ class ChatController extends Controller
         return response()->stream(function () use ($stream, $mentor, $user, $chat, $isTeacher) {
             // Lepas buffer PHP supaya tiap potongan langsung terkirim (tes menangkap output lewat buffer sendiri).
             if (! app()->runningUnitTests()) {
+                @ini_set('zlib.output_compression', '0');
                 while (ob_get_level() > 0) {
                     ob_end_flush();
                 }

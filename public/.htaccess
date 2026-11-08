@@ -1,3 +1,8 @@
+# Jawaban chat dikirim bertahap (Server-Sent Events); jangan dikompres supaya tidak ditahan server.
+<IfModule mod_setenvif.c>
+    SetEnvIfNoCase Request_URI "/kirim$" no-gzip=1 dont-vary=1
+</IfModule>
+
 <IfModule mod_rewrite.c>
     <IfModule mod_negotiation.c>
         Options -MultiViews -Indexes

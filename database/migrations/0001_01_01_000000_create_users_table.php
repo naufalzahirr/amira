@@ -17,6 +17,10 @@ return new class extends Migration
             $table->string('email')->unique();
             $table->timestamp('email_verified_at')->nullable();
             $table->string('password');
+            $table->string('role', 10)->default('murid'); // guru | murid
+            $table->timestamp('adult_confirmed_at')->nullable(); // pernyataan usia 18+
+            $table->text('gemini_key')->nullable(); // terenkripsi
+            $table->text('groq_key')->nullable();   // terenkripsi, hanya guru
             $table->rememberToken();
             $table->timestamps();
         });

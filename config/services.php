@@ -34,14 +34,5 @@ return [
             'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
         ],
     ],
-    'gemini' => [
-    'key'   => env('GEMINI_API_KEY'),
-    'model' => env('GEMINI_MODEL', 'gemini-3-pro'),
-    ],
-
-    'groq' => [
-        'key'   => env('GROQ_API_KEY'),
-        'model' => env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-    ],
 
 ];

@@ -2,173 +2,167 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\ResourceFile;
-use App\Models\Subject;
-use App\Services\AmiraChatService;
+use App\Models\Conversation;
+use App\Models\Mentor;
+use App\Models\Message;
+use App\Services\Ai\MentorChat;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Blade;
+use Illuminate\Support\Facades\Storage;
+use Throwable;
 
 class ChatController extends Controller
 {
-    /**
-     * Halaman chat AMIRA untuk siswa.
-     */
-    public function index()
+    public function show(Request $request, MentorChat $chat, Mentor $mentor, ?Conversation $conversation = null)
     {
-        $providersConfig = config('amira.providers');
-        $defaultProvider = config('amira.default_provider');
-        $defaultModels   = config('amira.default_models', []);
+        $user = $request->user();
+        $classroom = $mentor->classroom;
+        abort_unless($classroom->hasMember($user), 403);
+        abort_unless($mentor->is_active || $user->id === $classroom->teacher_id, 404);
 
-        $defaultModel = $defaultModels[$defaultProvider] ?? null;
+        if ($conversation) {
+            abort_unless($conversation->user_id === $user->id && $conversation->mentor_id === $mentor->id, 404);
+        }
 
-        $subjects  = Subject::orderBy('name')->get();
-        $resources = ResourceFile::with('subjects')->latest()->get();
+        $conversations = $user->conversations()->where('mentor_id', $mentor->id)->latest('updated_at')->take(30)->get();
+        $messages = $conversation?->messages()->orderBy('id')->get() ?? collect();
+        $used = $user->isTeacher() ? null : $chat->usedToday($user, $classroom);
+        $presets = $mentor->presets ?: config('amira.default_presets');
+        $hintLevel = $conversation?->hint_level ?? 1;
+        // Avatar yang sama dipakai JavaScript untuk gelembung jawaban baru.
+        $avatarHtml = Blade::render('<x-mentor-avatar :mentor="$mentor" />', ['mentor' => $mentor]);
 
-        return view('amira.chat', [
-            'providersConfig' => $providersConfig,
-            'defaultProvider' => $defaultProvider,
-            'defaultModel'    => $defaultModel,
-            'subjects'        => $subjects,
-            'resources'       => $resources,
+        return view('chat.show', compact('mentor', 'classroom', 'conversation', 'conversations', 'messages', 'used', 'presets', 'hintLevel', 'avatarHtml'));
+    }
+
+    public function send(Request $request, Mentor $mentor, MentorChat $chat)
+    {
+        $user = $request->user();
+        abort_unless($mentor->classroom->hasMember($user), 403);
+        abort_unless($mentor->is_active || $user->id === $mentor->classroom->teacher_id, 404);
+
+        if (! $user->isTeacher() && ! $user->privacy_ack_at) {
+            return response()->json(['error' => 'Baca dan setujui pemberitahuan privasi di halaman chat dulu.'], 422);
+        }
+
+        $data = $request->validate([
+            'message' => ['nullable', 'string', 'max:6000', 'required_without_all:image,next_hint'],
+            'conversation_id' => ['nullable', 'integer'],
+            'next_hint' => ['nullable', 'boolean'],
+            'image' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp', 'max:8192'],
+        ], [
+            'message.required_without_all' => 'Tulis pesan atau lampirkan gambar.',
+            'image.mimes' => 'Gambar harus JPG, PNG, atau WebP.',
+            'image.max' => 'Ukuran gambar maksimal 8 MB.',
+        ]);
+
+        $conversation = null;
+        if (! empty($data['conversation_id'])) {
+            $conversation = Conversation::where('id', $data['conversation_id'])
+                ->where('user_id', $user->id)
+                ->where('mentor_id', $mentor->id)
+                ->firstOrFail();
+        }
+
+        $result = $chat->start(
+            $user, $mentor, $conversation, (string) ($data['message'] ?? ''),
+            $request->file('image'), $request->boolean('next_hint'),
+        );
+
+        if ($result->status === 'busy') {
+            return response()->json([
+                'busy' => true,
+                'retry_after' => $result->retryAfter,
+                'message' => 'AMIRA sedang ramai dipakai teman sekelasmu.',
+            ], 429);
+        }
+
+        if ($result->status === 'failed') {
+            return response()->json(['error' => $result->error], 422);
+        }
+
+        $stream = $result->stream;
+        $isTeacher = $user->isTeacher();
+
+        return response()->stream(function () use ($stream, $mentor, $user, $chat, $isTeacher) {
+            // Lepas buffer PHP supaya tiap potongan langsung terkirim (tes menangkap output lewat buffer sendiri).
+            if (! app()->runningUnitTests()) {
+                while (ob_get_level() > 0) {
+                    ob_end_flush();
+                }
+            }
+
+            $send = function (array $event) {
+                echo 'data: '.json_encode($event, JSON_UNESCAPED_UNICODE)."\n\n";
+                flush();
+            };
+
+            try {
+                $reply = $stream->run(fn (string $visible) => $send([
+                    'type' => 'delta',
+                    'html' => Message::renderMarkdown($visible),
+                ]));
+            } catch (Throwable $e) {
+                report($e);
+                $send(['type' => 'error', 'message' => 'Jawaban terputus. Kirim ulang pesanmu.']);
+
+                return;
+            }
+
+            $conversation = $reply->conversation;
+            $userMessage = $conversation->messages()->where('role', 'user')->latest('id')->first();
+
+            $send([
+                'type' => 'done',
+                'conversation_id' => $conversation->id,
+                'conversation_url' => route('chat.conversation', [$mentor, $conversation]),
+                'reply_html' => $reply->html(),
+                'reply_text' => $reply->content,
+                'topic' => $reply->topic,
+                'solved' => $reply->solved,
+                'hint_used' => $reply->hint_level,
+                'hint_level' => $conversation->hint_level,
+                'image_url' => $userMessage?->image_path ? route('chat.image', $userMessage) : null,
+                'via' => $isTeacher ? $this->via($stream->attempt) : null,
+                'used' => $isTeacher ? null : $chat->usedToday($user, $mentor->classroom),
+            ]);
+        }, 200, [
+            'Content-Type' => 'text/event-stream',
+            'Cache-Control' => 'no-cache, no-transform',
+            'X-Accel-Buffering' => 'no',
         ]);
     }
 
-    /**
-     * Endpoint AJAX untuk mengirim pesan + file/gambar ke AMIRA.
-     */
-    public function chat(Request $request, AmiraChatService $amiraChatService)
+    /** Lampiran gambar hanya bisa dibuka pemilik percakapan. */
+    public function image(Request $request, Message $message)
     {
-        $validated = $request->validate([
-            'message'     => 'nullable|string',
-            'provider'    => 'nullable|in:gemini,groq',
-            'model'       => 'nullable|string',
-            'resources'   => 'nullable|array',
-            'resources.*' => 'integer|exists:resource_files,id',
-            'image'       => 'nullable|image|max:15360', // 15MB
-            'document'    => 'nullable|file|mimes:pdf,doc,docx,ppt,pptx,txt|max:51200', // 50MB
+        abort_unless($message->image_path && $message->conversation->user_id === $request->user()->id, 404);
+
+        return Storage::response($message->image_path, null, [
+            'Content-Type' => $message->image_mime,
+            'Cache-Control' => 'private, max-age=86400',
         ]);
+    }
 
-        $hasMessage  = trim($validated['message'] ?? '') !== '';
-        $hasImage    = $request->hasFile('image');
-        $hasDocument = $request->hasFile('document');
+    public function destroy(Request $request, Conversation $conversation)
+    {
+        abort_unless($conversation->user_id === $request->user()->id, 404);
+        $mentor = $conversation->mentor;
 
-        if (! $hasMessage && ! $hasImage && ! $hasDocument) {
-            return response()->json([
-                'success' => false,
-                'error'   => 'Minimal isi pesan, unggah gambar, atau unggah dokumen.',
-            ], 422);
+        foreach ($conversation->messages()->whereNotNull('image_path')->pluck('image_path') as $path) {
+            Storage::delete($path);
         }
+        $conversation->delete();
 
-        $provider = $validated['provider'] ?? config('amira.default_provider');
+        return redirect()->route('chat.show', $mentor)->with('status', 'Percakapan dihapus.');
+    }
 
-        // ====== 1) BACA RESOURCE TERPILIH (DARI DATABASE) ======
-        $contextText = null;
-
-        $resourceIds = $validated['resources'] ?? [];
-        if (!empty($resourceIds)) {
-            $resources = ResourceFile::with('subjects')
-                ->whereIn('id', $resourceIds)
-                ->get();
-
-            if ($resources->isNotEmpty()) {
-                $lines = [];
-                foreach ($resources as $index => $res) {
-                    $subjects = $res->subjects->pluck('name')->implode(', ');
-                    $desc     = $res->description ? Str::limit($res->description, 200) : null;
-
-                    $line = ($index + 1) . '. ' . $res->title;
-                    if ($subjects) {
-                        $line .= " (Mapel: {$subjects})";
-                    }
-                    if ($desc) {
-                        $line .= " – Ringkasan: {$desc}";
-                    }
-
-                    $lines[] = $line;
-                }
-
-                $contextText = "Bahan ajar yang dirujuk siswa:\n" . implode("\n", $lines);
-            }
-        }
-
-        // ====== 2) DOKUMEN BARU DI-UPLOAD (SEMENTARA) -> Gemini File API ======
-        $geminiFileData = null;
-
-        if ($hasDocument) {
-            $file      = $request->file('document');
-            $mime      = $file->getClientMimeType();
-            $extension = strtolower($file->getClientOriginalExtension());
-
-            $extra = "Siswa mengunggah dokumen bernama '{$file->getClientOriginalName()}' (tipe: {$mime}).";
-
-            // Kalau provider = Gemini → coba upload ke File API
-            if ($provider === 'gemini') {
-                $uploaded = $amiraChatService->uploadGeminiFile($file);
-
-                if ($uploaded) {
-                    $geminiFileData = [
-                        'uri'      => $uploaded['uri'],
-                        'mimeType' => $uploaded['mimeType'],
-                    ];
-
-                    $extra .= "\nGunakan isi dokumen ini sebagai bahan utama untuk menjawab pertanyaan atau memberi ringkasan yang membantu siswa.";
-                } else {
-                    // Fallback: kalau simple text file, ekstrak sebagian teks
-                    $docText = null;
-
-                    if (in_array($extension, ['txt', 'md', 'csv'])) {
-                        $docText = file_get_contents($file->getRealPath());
-                        $docText = Str::limit($docText, 8000);
-                    }
-
-                    if ($docText) {
-                        $extra .= "\nBerikut cuplikan isi dokumen:\n" . $docText;
-                    } else {
-                        $extra .= "\nJika isi detail dokumen tidak terbaca, berikan jawaban umum dan ajak siswa menuliskan poin penting dari dokumen tersebut.";
-                    }
-                }
-            } else {
-                // Provider bukan Gemini → hanya pakai teks sederhana sebagai konteks
-                $docText = null;
-                if (in_array($extension, ['txt', 'md', 'csv'])) {
-                    $docText = file_get_contents($file->getRealPath());
-                    $docText = Str::limit($docText, 8000);
-                }
-
-                if ($docText) {
-                    $extra .= "\nBerikut cuplikan isi dokumen:\n" . $docText;
-                } else {
-                    $extra .= "\nGunakan informasi ini hanya sebagai catatan bahwa siswa sedang merujuk ke dokumen tersebut.";
-                }
-            }
-
-            $contextText = trim(($contextText ? $contextText . "\n\n" : '') . $extra);
-        }
-
-        // ====== 3) BACA GAMBAR YANG DI-UPLOAD ======
-        $imageBase64   = null;
-        $imageMimeType = null;
-
-        if ($hasImage) {
-            $image         = $request->file('image');
-            $imageMimeType = $image->getClientMimeType();
-            $imageBase64   = base64_encode(file_get_contents($image->getRealPath()));
-        }
-
-        // ====== 4) PANGGIL SERVICE AMIRA ======
-        $reply = $amiraChatService->chat(
-            $validated['message'] ?? '',
-            $provider,
-            $validated['model'] ?? null,
-            $contextText,
-            $imageBase64,
-            $imageMimeType,
-            $geminiFileData
-        );
-
-        return response()->json([
-            'success' => true,
-            'reply'   => $reply,
-        ]);
+    private function via(array $attempt): string
+    {
+        return match (true) {
+            $attempt['provider'] === 'groq' => 'cadangan Groq',
+            $attempt['source'] === 'murid' => 'key murid',
+            default => 'Gemini',
+        };
     }
 }

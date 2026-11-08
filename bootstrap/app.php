@@ -3,22 +3,18 @@
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
-use App\Http\Middleware\IsAdmin; // ← tambah ini
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: __DIR__.'/../routes/web.php',
-        // api: __DIR__.'/../routes/api.php',
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
     )
-    ->withMiddleware(function (Middleware $middleware) {
-        // daftar alias middleware di sini
-        $middleware->alias([
-            'is_admin' => IsAdmin::class,
-        ]);
+    ->withMiddleware(function (Middleware $middleware): void {
+        $middleware->alias(['guru' => \App\Http\Middleware\EnsureTeacher::class]);
+        $middleware->redirectGuestsTo('/masuk');
+        $middleware->redirectUsersTo('/beranda');
     })
-    ->withExceptions(function (Exceptions $exceptions) {
+    ->withExceptions(function (Exceptions $exceptions): void {
         //
-    })
-    ->create();
+    })->create();

@@ -19,8 +19,6 @@
 /storage/*.key
 /storage/pail
 /vendor
-/.agents
-/.codex
 Homestead.json
 Homestead.yaml
 Thumbs.db
